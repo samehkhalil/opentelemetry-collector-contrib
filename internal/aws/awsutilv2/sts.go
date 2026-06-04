@@ -9,9 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 	"sync/atomic"
 
+	"github.com/amazon-contributing/opentelemetry-collector-contrib/override/awsv2"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials/stscreds"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
@@ -27,8 +27,8 @@ const (
 	envSourceArn           = "AMZ_SOURCE_ARN"
 )
 
-// stsCredentialsProvider retrieves credentials from the regional STS endpoint, falling back to the
-// partition's primary endpoint when the region is disabled.
+// stsCredentialsProvider retrieves credentials from the regional STS endpoint, falling back to
+// the partition's primary endpoint when the region is disabled.
 type stsCredentialsProvider struct {
 	// fallback latches onto partitional after the first RegionDisabledException. Atomic so the
 	// latch is race-safe when callers use this provider unwrapped.
@@ -54,18 +54,30 @@ func (p *stsCredentialsProvider) Retrieve(ctx context.Context) (aws.Credentials,
 	return creds, err
 }
 
+var getPartitionPrimaryRegion = awsv2.GetPartitionPrimaryRegion
+
+// newStsCredentialsProvider returns a credentials provider that assumes roleARN at the regional
+// STS endpoint. When the region's partition primary is known, the provider falls back to that
+// primary on RegionDisabledException; otherwise the bare regional provider is returned and no
+// fallback is attempted.
 func newStsCredentialsProvider(cfg aws.Config, roleARN, region, externalID string) aws.CredentialsProvider {
 	regionalCfg := cfg.Copy()
 	regionalCfg.Region = region
-	partitionalCfg := cfg.Copy()
-	partitionalCfg.Region = getFallbackRegion(region)
 	opts := func(o *stscreds.AssumeRoleOptions) {
 		if externalID != "" {
 			o.ExternalID = &externalID
 		}
 	}
+	regional := stscreds.NewAssumeRoleProvider(newAssumeRoleClient(regionalCfg), roleARN, opts)
+
+	fallback := getPartitionPrimaryRegion(region)
+	if fallback == "" {
+		return regional
+	}
+	partitionalCfg := cfg.Copy()
+	partitionalCfg.Region = fallback
 	return &stsCredentialsProvider{
-		regional:    stscreds.NewAssumeRoleProvider(newAssumeRoleClient(regionalCfg), roleARN, opts),
+		regional:    regional,
 		partitional: stscreds.NewAssumeRoleProvider(newAssumeRoleClient(partitionalCfg), roleARN, opts),
 	}
 }
@@ -105,21 +117,4 @@ func (m *confusedDeputyHeaders) HandleBuild(ctx context.Context, in smithymiddle
 	req.Header.Set(sourceArnHeaderKey, m.sourceArn)
 	req.Header.Set(sourceAccountHeaderKey, m.sourceAccount)
 	return next.HandleBuild(ctx, in)
-}
-
-// getFallbackRegion returns the partition's primary region, whose STS endpoint cannot be deactivated, used
-// when the regional endpoint is disabled.
-func getFallbackRegion(region string) string {
-	switch {
-	case strings.HasPrefix(region, "cn-"):
-		return "cn-north-1"
-	case strings.HasPrefix(region, "us-gov-"):
-		return "us-gov-west-1"
-	case strings.HasPrefix(region, "us-isob-"):
-		return "us-isob-east-1"
-	case strings.HasPrefix(region, "us-iso-"):
-		return "us-iso-east-1"
-	default:
-		return "us-east-1"
-	}
 }
