@@ -55,15 +55,24 @@ Each entry in `dra_device_types` supports:
 | `device_id_attribute` | The metric attribute key holding the device identifier. | (required) |
 | `device_id_source` | Where to find the device ID: `"datapoint"` or `"resource"`. | `"datapoint"` |
 | `driver_names` | List of DRA driver names to match against in ResourceClaim allocation results. | (required) |
-| `device_id_pattern` | Regex applied to the DRA device name to extract the metric correlation ID. The first capture group is used. If empty, the full device name is used as-is. | `""` (use full name) |
+| `dra_device_id_attribute` | Selects the **source** of the correlation key. Empty (default) sources from the DRA device name. When set, it names a ResourceSlice device attribute whose value is used as the source instead — for drivers whose device name does not match the metric label but an attribute does. Requires `resourceslices` RBAC when set. | `""` (use device name) |
+| `dra_device_id_pattern` | Optional regex **transform** applied to the resolved source (device name, or the attribute value selected by `dra_device_id_attribute`). The first capture group is used. If empty, the source is used as-is. | `""` (use source as-is) |
 
-#### Device ID Pattern
+#### How the correlation key is derived
 
-The `device_id_pattern` field allows you to transform DRA device names into the values that appear in your metrics. For example:
+The DRA key is computed in two steps — pick a **source**, then optionally apply a **transform**:
 
-- NVIDIA GPU DRA driver allocates devices named `gpu-0`, `gpu-1`, etc. Your metrics have `gpu_device="0"`. Use pattern `gpu-(\d+)` to extract `"0"`.
-- Neuron DRA driver allocates devices named `neuron-0`, `neuron-1`, etc. Your metrics have `NeuronDevice="0"`. Use pattern `neuron-(\d+)`.
-- If the DRA device name already matches the metric attribute value, omit the pattern.
+1. **Source** (`dra_device_id_attribute`):
+   - *Empty* → the DRA device name from the ResourceClaim allocation result.
+   - *Set* → the value of that ResourceSlice device attribute. The processor runs a ResourceSlice informer, indexes each device's attributes by `{driver, pool, device}`, and reads the named attribute. If the slice or attribute is absent for a device, that device is skipped (no guessed correlation).
+2. **Transform** (`dra_device_id_pattern`): an optional regex whose first capture group becomes the key. It applies to whichever source was resolved, so it can extract from a device name *or* normalize an attribute value.
+
+Examples:
+
+- **GPU** (source = name, transform = regex): the NVIDIA GPU DRA driver allocates `gpu-0`, `gpu-1`, …; metrics carry `gpu="0"`. Use `dra_device_id_pattern: "gpu-(\d+)"`.
+- **Neuron** (source = name, transform = regex): the Neuron DRA driver allocates `neuron-device-0`, `neuron-device-1`, …; metrics carry `aws.neuron.device="0"`. Use `dra_device_id_pattern: "neuron-device-(\d+)"`.
+- **EFA** (source = attribute, no transform): EFA via `dra.net` allocates `pci-0000-00-1f-0`, but metrics carry `aws.efa.device="rdmap0s31"`. The two identifiers are unrelated, so a regex on the name can't bridge them; the ResourceSlice publishes `dra.net/rdmaDevice="rdmap0s31"`. Set `dra_device_id_attribute: dra.net/rdmaDevice`.
+- If the DRA device name already equals the metric value, set neither field.
 
 ### Examples
 
@@ -97,15 +106,20 @@ processors:
   awsdevicepodcorrelation:
     dra_device_types:
       - name: gpu-dra
-        device_id_attribute: gpu_device
+        device_id_attribute: gpu
         driver_names:
           - gpu.nvidia.com
-        device_id_pattern: "gpu-(\\d+)"
+        dra_device_id_pattern: "gpu-(\\d+)"
       - name: neuron-dra
         device_id_attribute: NeuronDevice
         driver_names:
           - neuron.aws.com
-        device_id_pattern: "neuron-(\\d+)"
+        dra_device_id_pattern: "neuron-device-(\\d+)"
+      - name: efa-dra
+        device_id_attribute: aws.efa.device
+        driver_names:
+          - dra.net
+        dra_device_id_attribute: dra.net/rdmaDevice
 ```
 
 #### Mixed (Migration Period)
@@ -123,10 +137,10 @@ processors:
           - nvidia.com/gpu
     dra_device_types:
       - name: gpu-dra
-        device_id_attribute: gpu_device
+        device_id_attribute: gpu
         driver_names:
           - gpu.nvidia.com
-        device_id_pattern: "gpu-(\\d+)"
+        dra_device_id_pattern: "gpu-(\\d+)"
 ```
 
 ## RBAC Requirements
@@ -145,9 +159,14 @@ rules:
   - apiGroups: ["resource.k8s.io"]
     resources: ["resourceclaims"]
     verbs: ["get", "list", "watch"]
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceslices"]
+    verbs: ["get", "list", "watch"]
 ```
 
-The pod informer is filtered to `spec.nodeName=<current-node>`, so only pods on the local node are watched. The `NODE_NAME` environment variable must be set (typically via the downward API):
+The `resourceslices` permission is only required when a `dra_device_types` entry sets `dra_device_id_attribute` (an attribute source). In that case the processor starts a ResourceSlice informer to read the referenced device attribute; without the permission the informer cache never syncs and DRA correlation fails to start. If every entry uses `dra_device_id_pattern` (or neither field), the ResourceSlice informer is not started and this permission can be omitted.
+
+The pod and ResourceSlice informers are filtered to `spec.nodeName=<current-node>`, so only objects on the local node are watched. The `NODE_NAME` environment variable must be set (typically via the downward API):
 
 ```yaml
 env:

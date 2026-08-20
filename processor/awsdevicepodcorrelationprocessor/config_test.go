@@ -133,16 +133,31 @@ func TestValidate_DRAInvalidDeviceIDSource(t *testing.T) {
 func TestValidate_DRAInvalidRegex(t *testing.T) {
 	cfg := &Config{
 		DRADeviceTypes: []DRADeviceTypeConfig{
-			{Name: "gpu-dra", DeviceIDAttribute: "dev", DriverNames: []string{"gpu.nvidia.com"}, DeviceIDPattern: "[invalid"},
+			{Name: "gpu-dra", DeviceIDAttribute: "dev", DriverNames: []string{"gpu.nvidia.com"}, DRADeviceIDPattern: "[invalid"},
 		},
 	}
-	assert.ErrorContains(t, cfg.Validate(), "invalid device_id_pattern")
+	assert.ErrorContains(t, cfg.Validate(), "invalid dra_device_id_pattern")
 }
 
 func TestValidate_DRAValidRegex(t *testing.T) {
 	cfg := &Config{
 		DRADeviceTypes: []DRADeviceTypeConfig{
-			{Name: "gpu-dra", DeviceIDAttribute: "dev", DriverNames: []string{"gpu.nvidia.com"}, DeviceIDPattern: `gpu-(\d+)`},
+			{Name: "gpu-dra", DeviceIDAttribute: "dev", DriverNames: []string{"gpu.nvidia.com"}, DRADeviceIDPattern: `gpu-(\d+)`},
+		},
+	}
+	assert.NoError(t, cfg.Validate())
+}
+
+func TestValidate_DRAAttributeAndPatternCompose(t *testing.T) {
+	cfg := &Config{
+		DRADeviceTypes: []DRADeviceTypeConfig{
+			{
+				Name:                 "efa-dra",
+				DeviceIDAttribute:    "aws.efa.device",
+				DriverNames:          []string{"dra.net"},
+				DRADeviceIDAttribute: "dra.net/rdmaDevice",
+				DRADeviceIDPattern:   `(rdmap\d+s\d+)`,
+			},
 		},
 	}
 	assert.NoError(t, cfg.Validate())

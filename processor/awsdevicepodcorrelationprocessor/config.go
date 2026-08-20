@@ -77,11 +77,27 @@ type DRADeviceTypeConfig struct {
 	// ResourceClaim allocation results (e.g., ["gpu.nvidia.com", "neuron.aws.com"]).
 	DriverNames []string `mapstructure:"driver_names"`
 
-	// DeviceIDPattern is a regex applied to the DRA device name to extract
-	// the value that should match the metric attribute. The first capture group
-	// is used. If empty, the full device name is used as-is.
-	// Example: "gpu-(\d+)" extracts "0" from "gpu-0".
-	DeviceIDPattern string `mapstructure:"device_id_pattern"`
+	// DRADeviceIDAttribute selects the *source* from which the DRA correlation key
+	// is derived. When empty (the default), the source is the DRA device name from
+	// the ResourceClaim allocation result. When set, it names a ResourceSlice
+	// device attribute whose value is used as the source instead — for drivers
+	// whose device name does not match the metric label but an attribute does.
+	// Example (EFA via dra.net): device name "pci-0000-00-1f-0" does not match the
+	// metric label "rdmap0s31", but the attribute "dra.net/rdmaDevice" holds
+	// "rdmap0s31"; setting this to "dra.net/rdmaDevice" bridges them. Reading from
+	// an attribute requires a ResourceSlice informer (and resourceslices RBAC).
+	//
+	// This is the DRA/cluster-side key source and is distinct from
+	// device_id_attribute above, which names the metric label to match against.
+	DRADeviceIDAttribute string `mapstructure:"dra_device_id_attribute"`
+
+	// DRADeviceIDPattern is an optional regex applied to the resolved source
+	// string (the device name, or the attribute value selected by
+	// dra_device_id_attribute) to extract the value that should match the metric
+	// attribute. The first capture group is used. If empty, the source string is
+	// used as-is. Example: "gpu-(\d+)" extracts "0" from device name "gpu-0".
+	// It composes with either source, so it may also normalize an attribute value.
+	DRADeviceIDPattern string `mapstructure:"dra_device_id_pattern"`
 }
 
 // setDefaults applies default values to the configuration.
@@ -139,9 +155,9 @@ func (cfg *Config) Validate() error {
 		if dt.DeviceIDSource != "" && dt.DeviceIDSource != DeviceIDSourceDatapoint && dt.DeviceIDSource != DeviceIDSourceResource {
 			return fmt.Errorf("dra_device_types[%d]: device_id_source must be %q or %q, got %q", i, DeviceIDSourceDatapoint, DeviceIDSourceResource, dt.DeviceIDSource)
 		}
-		if dt.DeviceIDPattern != "" {
-			if _, err := regexp.Compile(dt.DeviceIDPattern); err != nil {
-				return fmt.Errorf("dra_device_types[%d]: invalid device_id_pattern: %w", i, err)
+		if dt.DRADeviceIDPattern != "" {
+			if _, err := regexp.Compile(dt.DRADeviceIDPattern); err != nil {
+				return fmt.Errorf("dra_device_types[%d]: invalid dra_device_id_pattern: %w", i, err)
 			}
 		}
 		if seen[dt.Name] {

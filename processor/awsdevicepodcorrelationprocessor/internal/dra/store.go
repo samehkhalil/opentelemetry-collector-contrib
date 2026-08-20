@@ -5,6 +5,7 @@ package dra // import "github.com/open-telemetry/opentelemetry-collector-contrib
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
@@ -35,18 +36,27 @@ type DeviceTypeConfig struct {
 	DeviceIDAttribute string
 	DeviceIDSource    string // "datapoint" or "resource"
 	DriverNames       []string
-	DeviceIDPattern   *regexp.Regexp // extracts metric device ID from DRA device name
+	SourceAttribute   string
+	DeviceIDPattern   *regexp.Regexp
 }
 
-// driverConfig holds the pre-compiled pattern for a single driver name.
+// driverConfig holds the pre-compiled keying config for a single driver name.
 type driverConfig struct {
-	pattern *regexp.Regexp
+	pattern         *regexp.Regexp
+	sourceAttribute string
 }
 
 // draDeviceKey is the lookup key for DRA-allocated devices.
 type draDeviceKey struct {
 	DeviceID   string
 	DriverName string
+}
+
+// sliceDeviceKey identifies a device instance within a ResourceSlice pool.
+type sliceDeviceKey struct {
+	Driver string
+	Pool   string
+	Device string
 }
 
 // Store watches Pods and ResourceClaims via the K8s API and maintains
@@ -64,9 +74,14 @@ type Store struct {
 	cancel       context.CancelFunc
 	podFactory   informers.SharedInformerFactory
 	claimFactory informers.SharedInformerFactory
+	sliceFactory informers.SharedInformerFactory
 
 	podInformer   cache.SharedIndexInformer
 	claimInformer cache.SharedIndexInformer
+	sliceInformer cache.SharedIndexInformer // non-nil only when an attribute ref is configured
+
+	// needSlices is true when any tracked driver keys on a ResourceSlice attribute.
+	needSlices bool
 
 	// debounce state
 	debounceMu    sync.Mutex
@@ -110,14 +125,20 @@ func NewStore(logger *zap.Logger, opts ...StoreOption) *Store {
 // ResourceClaims, and begins watching for changes.
 func (s *Store) Start(ctx context.Context) error {
 	if s.nodeName == "" {
-		return fmt.Errorf("node name is required: set NODE_NAME env var or use WithNodeName option")
+		return errors.New("node name is required: set NODE_NAME env var or use WithNodeName option")
 	}
 
 	// Build immutable trackedDrivers map from configs.
 	s.trackedDrivers = make(map[string]driverConfig, len(s.configs)*2)
 	for _, cfg := range s.configs {
 		for _, dn := range cfg.DriverNames {
-			s.trackedDrivers[dn] = driverConfig{pattern: cfg.DeviceIDPattern}
+			s.trackedDrivers[dn] = driverConfig{
+				pattern:         cfg.DeviceIDPattern,
+				sourceAttribute: cfg.SourceAttribute,
+			}
+		}
+		if cfg.SourceAttribute != "" {
+			s.needSlices = true
 		}
 	}
 
@@ -149,11 +170,13 @@ func (s *Store) Start(ctx context.Context) error {
 	s.podInformer = podInformer
 
 	handler := cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(_ interface{}) { s.scheduleRebuild() },
-		UpdateFunc: func(_, _ interface{}) { s.scheduleRebuild() },
-		DeleteFunc: func(_ interface{}) { s.scheduleRebuild() },
+		AddFunc:    func(_ any) { s.scheduleRebuild() },
+		UpdateFunc: func(_, _ any) { s.scheduleRebuild() },
+		DeleteFunc: func(_ any) { s.scheduleRebuild() },
 	}
-	podInformer.AddEventHandler(handler)
+	if _, err := podInformer.AddEventHandler(handler); err != nil {
+		return fmt.Errorf("failed to add pod event handler: %w", err)
+	}
 
 	// ResourceClaims informer — watch all namespaces.
 	// On large clusters this may be significant. A future optimization could
@@ -161,15 +184,40 @@ func (s *Store) Start(ctx context.Context) error {
 	s.claimFactory = informers.NewSharedInformerFactory(s.client, 30*time.Second)
 	claimInformer := s.claimFactory.Resource().V1beta1().ResourceClaims().Informer()
 	s.claimInformer = claimInformer
-	claimInformer.AddEventHandler(handler)
+	if _, err := claimInformer.AddEventHandler(handler); err != nil {
+		return fmt.Errorf("failed to add resourceclaim event handler: %w", err)
+	}
+
+	// ResourceSlices informer — only needed when a device type keys on a
+	// ResourceSlice attribute (dra_device_id_attribute). Filter to this node.
+	if s.needSlices {
+		s.sliceFactory = informers.NewSharedInformerFactoryWithOptions(
+			s.client,
+			30*time.Second,
+			informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
+				opts.FieldSelector = "spec.nodeName=" + s.nodeName
+			}),
+		)
+		sliceInformer := s.sliceFactory.Resource().V1beta1().ResourceSlices().Informer()
+		s.sliceInformer = sliceInformer
+		if _, err := sliceInformer.AddEventHandler(handler); err != nil {
+			return fmt.Errorf("failed to add resourceslice event handler: %w", err)
+		}
+	}
 
 	s.podFactory.Start(ctx.Done())
 	s.claimFactory.Start(ctx.Done())
 
+	syncFuncs := []cache.InformerSynced{podInformer.HasSynced, claimInformer.HasSynced}
+	if s.sliceInformer != nil {
+		s.sliceFactory.Start(ctx.Done())
+		syncFuncs = append(syncFuncs, s.sliceInformer.HasSynced)
+	}
+
 	// Wait for initial cache sync.
-	if !cache.WaitForCacheSync(ctx.Done(), podInformer.HasSynced, claimInformer.HasSynced) {
+	if !cache.WaitForCacheSync(ctx.Done(), syncFuncs...) {
 		cancel()
-		return fmt.Errorf("failed to sync informer caches")
+		return errors.New("failed to sync informer caches")
 	}
 
 	s.rebuild()
@@ -233,6 +281,32 @@ func (s *Store) rebuild() {
 		claimIndex[claim.Namespace+"/"+claim.Name] = claim
 	}
 
+	// Index ResourceSlice device attributes (only if any driver keys on one).
+	// Key: {driver, pool, device} -> {attribute name -> string value}.
+	var sliceIndex map[sliceDeviceKey]map[string]string
+	if s.sliceInformer != nil {
+		slices := s.sliceInformer.GetStore().List()
+		sliceIndex = make(map[sliceDeviceKey]map[string]string, len(slices))
+		for _, obj := range slices {
+			slice, ok := obj.(*resourceapi.ResourceSlice)
+			if !ok {
+				continue
+			}
+			for _, dev := range slice.Spec.Devices {
+				if dev.Basic == nil {
+					continue
+				}
+				attrs := make(map[string]string, len(dev.Basic.Attributes))
+				for qn, attr := range dev.Basic.Attributes {
+					if attr.StringValue != nil {
+						attrs[string(qn)] = *attr.StringValue
+					}
+				}
+				sliceIndex[sliceDeviceKey{Driver: slice.Spec.Driver, Pool: slice.Spec.Pool.Name, Device: dev.Name}] = attrs
+			}
+		}
+	}
+
 	newMap := make(map[draDeviceKey]types.ContainerInfo)
 
 	for _, obj := range pods {
@@ -265,10 +339,38 @@ func (s *Store) rebuild() {
 				}
 
 				deviceName := result.Device
-				lookupID := deviceName
+
+				// Resolve the source string: either the device name (default) or
+				// the value of a ResourceSlice attribute when sourceAttribute is set.
+				source := deviceName
+				if dc.sourceAttribute != "" {
+					// Skip the device if the slice or attribute is missing —
+					// guessing would create a wrong correlation.
+					attrs, ok := sliceIndex[sliceDeviceKey{Driver: result.Driver, Pool: result.Pool, Device: deviceName}]
+					if !ok {
+						s.logger.Debug("DRA device has no matching ResourceSlice, skipping attribute keying",
+							zap.String("driver", result.Driver),
+							zap.String("pool", result.Pool),
+							zap.String("device", deviceName),
+						)
+						continue
+					}
+					val, ok := attrs[dc.sourceAttribute]
+					if !ok {
+						s.logger.Debug("ResourceSlice device missing referenced attribute, skipping",
+							zap.String("driver", result.Driver),
+							zap.String("device", deviceName),
+							zap.String("attribute", dc.sourceAttribute),
+						)
+						continue
+					}
+					source = val
+				}
+
+				// Optionally apply the regex transform to the resolved source.
+				lookupID := source
 				if dc.pattern != nil {
-					matches := dc.pattern.FindStringSubmatch(deviceName)
-					if len(matches) >= 2 {
+					if matches := dc.pattern.FindStringSubmatch(source); len(matches) >= 2 {
 						lookupID = matches[1]
 					}
 				}
@@ -319,12 +421,22 @@ func (s *Store) buildClaimToContainerMap(pod *corev1.Pod) map[string]string {
 
 // resolveClaimName returns the actual ResourceClaim name for a pod's claim reference.
 func (s *Store) resolveClaimName(pod *corev1.Pod, podClaim corev1.PodResourceClaim) string {
+	// Directly-referenced claim: the name is authoritative.
 	if podClaim.ResourceClaimName != nil {
 		return *podClaim.ResourceClaimName
 	}
-	// Generated name from template: <pod-name>-<claim-name>
+	// Template-generated claim: the actual claim name carries a random suffix
+	// (e.g. <pod>-<claim>-abc12) that cannot be reconstructed by string
+	// concatenation. The resource-claim controller records the generated name in
+	// the pod status; read it there rather than guessing. If the status entry is
+	// not yet populated, return "" (no guess) so the caller skips this claim until
+	// the next rebuild.
 	if podClaim.ResourceClaimTemplateName != nil {
-		return pod.Name + "-" + podClaim.Name
+		for _, status := range pod.Status.ResourceClaimStatuses {
+			if status.Name == podClaim.Name && status.ResourceClaimName != nil {
+				return *status.ResourceClaimName
+			}
+		}
 	}
 	return ""
 }

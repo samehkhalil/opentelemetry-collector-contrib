@@ -62,7 +62,7 @@ func newTestStore(t *testing.T, pods []*corev1.Pod, claims []*resourceapi.Resour
 	podInformer := factory.Core().V1().Pods().Informer()
 	claimInformer := factory.Resource().V1beta1().ResourceClaims().Informer()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 
 	factory.Start(ctx.Done())
@@ -70,6 +70,63 @@ func newTestStore(t *testing.T, pods []*corev1.Pod, claims []*resourceapi.Resour
 
 	s.podInformer = podInformer
 	s.claimInformer = claimInformer
+	s.cancel = cancel
+
+	s.rebuild()
+	return s
+}
+
+func newTestStoreWithSlices(t *testing.T, pods []*corev1.Pod, claims []*resourceapi.ResourceClaim, slices []*resourceapi.ResourceSlice, configs []DeviceTypeConfig) *Store {
+	t.Helper()
+
+	objects := make([]runtime.Object, 0, len(pods)+len(claims)+len(slices))
+	for _, p := range pods {
+		objects = append(objects, p)
+	}
+	for _, c := range claims {
+		objects = append(objects, c)
+	}
+	for _, sl := range slices {
+		objects = append(objects, sl)
+	}
+
+	client := fakeclient.NewSimpleClientset(objects...)
+
+	trackedDrivers := make(map[string]driverConfig)
+	needSlices := false
+	for _, cfg := range configs {
+		for _, dn := range cfg.DriverNames {
+			trackedDrivers[dn] = driverConfig{pattern: cfg.DeviceIDPattern, sourceAttribute: cfg.SourceAttribute}
+		}
+		if cfg.SourceAttribute != "" {
+			needSlices = true
+		}
+	}
+
+	s := &Store{
+		deviceToPod:    make(map[draDeviceKey]types.ContainerInfo),
+		configs:        configs,
+		trackedDrivers: trackedDrivers,
+		needSlices:     needSlices,
+		nodeName:       "test-node",
+		logger:         zaptest.NewLogger(t),
+		client:         client,
+	}
+
+	factory := informers.NewSharedInformerFactory(client, 0)
+	podInformer := factory.Core().V1().Pods().Informer()
+	claimInformer := factory.Resource().V1beta1().ResourceClaims().Informer()
+	sliceInformer := factory.Resource().V1beta1().ResourceSlices().Informer()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+
+	factory.Start(ctx.Done())
+	cache.WaitForCacheSync(ctx.Done(), podInformer.HasSynced, claimInformer.HasSynced, sliceInformer.HasSynced)
+
+	s.podInformer = podInformer
+	s.claimInformer = claimInformer
+	s.sliceInformer = sliceInformer
 	s.cancel = cancel
 
 	s.rebuild()
@@ -344,6 +401,9 @@ func TestStore_ClaimMissing(t *testing.T) {
 }
 
 func TestStore_TemplatedClaimName(t *testing.T) {
+	// The generated claim name carries a random suffix that cannot be
+	// reconstructed by concatenation; the controller records it in pod status.
+	const generatedClaimName = "tmpl-pod-gpu-abc12"
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "tmpl-pod", Namespace: "default"},
 		Spec: corev1.PodSpec{
@@ -360,11 +420,15 @@ func TestStore_TemplatedClaimName(t *testing.T) {
 				},
 			},
 		},
+		Status: corev1.PodStatus{
+			ResourceClaimStatuses: []corev1.PodResourceClaimStatus{
+				{Name: "gpu", ResourceClaimName: ptrStr(generatedClaimName)},
+			},
+		},
 	}
 
-	// Generated name: <pod-name>-<claim-name>
 	claim := &resourceapi.ResourceClaim{
-		ObjectMeta: metav1.ObjectMeta{Name: "tmpl-pod-gpu", Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: generatedClaimName, Namespace: "default"},
 		Status: resourceapi.ResourceClaimStatus{
 			Allocation: &resourceapi.AllocationResult{
 				Devices: resourceapi.DeviceAllocationResult{
@@ -390,6 +454,263 @@ func TestStore_TemplatedClaimName(t *testing.T) {
 	require.NotNil(t, info)
 	assert.Equal(t, "tmpl-pod", info.PodName)
 	assert.Equal(t, "app", info.ContainerName)
+}
+
+// A template claim whose generated name is not yet recorded in pod status must
+// not be guessed: the device stays uncorrelated until the status is populated.
+func TestStore_TemplatedClaimName_NoStatusNotGuessed(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "tmpl-pod", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			NodeName: "test-node",
+			ResourceClaims: []corev1.PodResourceClaim{
+				{Name: "gpu", ResourceClaimTemplateName: ptrStr("gpu-template")},
+			},
+			Containers: []corev1.Container{
+				{
+					Name: "app",
+					Resources: corev1.ResourceRequirements{
+						Claims: []corev1.ResourceClaim{{Name: "gpu"}},
+					},
+				},
+			},
+		},
+	}
+
+	claim := &resourceapi.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "tmpl-pod-gpu", Namespace: "default"},
+		Status: resourceapi.ResourceClaimStatus{
+			Allocation: &resourceapi.AllocationResult{
+				Devices: resourceapi.DeviceAllocationResult{
+					Results: []resourceapi.DeviceRequestAllocationResult{
+						{Driver: "gpu.nvidia.com", Pool: "pool", Device: "gpu-0", Request: "req"},
+					},
+				},
+			},
+		},
+	}
+
+	configs := []DeviceTypeConfig{
+		{
+			Name:            "gpu",
+			DriverNames:     []string{"gpu.nvidia.com"},
+			DeviceIDPattern: regexp.MustCompile(`gpu-(\d+)`),
+		},
+	}
+
+	s := newTestStore(t, []*corev1.Pod{pod}, []*resourceapi.ResourceClaim{claim}, configs)
+
+	info := s.GetDRAContainerInfo("0", "gpu.nvidia.com")
+	assert.Nil(t, info, "template claim with no status entry must not be guessed")
+}
+
+func TestStore_AttributeRefKeying(t *testing.T) {
+	const generatedClaimName = "efa-pod-efa-device-vw7gn"
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "efa-pod", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			NodeName: "test-node",
+			ResourceClaims: []corev1.PodResourceClaim{
+				{Name: "efa-device", ResourceClaimTemplateName: ptrStr("efa-template")},
+			},
+			Containers: []corev1.Container{
+				{
+					Name:      "app",
+					Resources: corev1.ResourceRequirements{Claims: []corev1.ResourceClaim{{Name: "efa-device"}}},
+				},
+			},
+		},
+		Status: corev1.PodStatus{
+			ResourceClaimStatuses: []corev1.PodResourceClaimStatus{
+				{Name: "efa-device", ResourceClaimName: ptrStr(generatedClaimName)},
+			},
+		},
+	}
+
+	claim := &resourceapi.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: generatedClaimName, Namespace: "default"},
+		Status: resourceapi.ResourceClaimStatus{
+			Allocation: &resourceapi.AllocationResult{
+				Devices: resourceapi.DeviceAllocationResult{
+					Results: []resourceapi.DeviceRequestAllocationResult{
+						{Driver: "dra.net", Pool: "test-node", Device: "pci-0000-00-1f-0", Request: "req"},
+					},
+				},
+			},
+		},
+	}
+
+	slice := &resourceapi.ResourceSlice{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-node-dra.net"},
+		Spec: resourceapi.ResourceSliceSpec{
+			Driver:   "dra.net",
+			Pool:     resourceapi.ResourcePool{Name: "test-node"},
+			NodeName: "test-node",
+			Devices: []resourceapi.Device{
+				{
+					Name: "pci-0000-00-1f-0",
+					Basic: &resourceapi.BasicDevice{
+						Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+							"dra.net/rdmaDevice": {StringValue: ptrStr("rdmap0s31")},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	configs := []DeviceTypeConfig{
+		{
+			Name:            "efa-dra",
+			DriverNames:     []string{"dra.net"},
+			SourceAttribute: "dra.net/rdmaDevice",
+		},
+	}
+
+	s := newTestStoreWithSlices(t, []*corev1.Pod{pod}, []*resourceapi.ResourceClaim{claim}, []*resourceapi.ResourceSlice{slice}, configs)
+
+	// Keyed by the attribute value (matches the metric label).
+	info := s.GetDRAContainerInfo("rdmap0s31", "dra.net")
+	require.NotNil(t, info, "device must be keyed on the ResourceSlice attribute value")
+	assert.Equal(t, "efa-pod", info.PodName)
+	assert.Equal(t, "app", info.ContainerName)
+
+	// NOT keyed by the raw device name.
+	assert.Nil(t, s.GetDRAContainerInfo("pci-0000-00-1f-0", "dra.net"),
+		"device must not be keyed by its raw device name when attribute_ref is set")
+}
+
+func TestStore_AttributeSourceWithPattern(t *testing.T) {
+	const generatedClaimName = "efa-pod-efa-device-cmp01"
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "efa-pod", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			NodeName: "test-node",
+			ResourceClaims: []corev1.PodResourceClaim{
+				{Name: "efa-device", ResourceClaimTemplateName: ptrStr("efa-template")},
+			},
+			Containers: []corev1.Container{
+				{
+					Name:      "app",
+					Resources: corev1.ResourceRequirements{Claims: []corev1.ResourceClaim{{Name: "efa-device"}}},
+				},
+			},
+		},
+		Status: corev1.PodStatus{
+			ResourceClaimStatuses: []corev1.PodResourceClaimStatus{
+				{Name: "efa-device", ResourceClaimName: ptrStr(generatedClaimName)},
+			},
+		},
+	}
+
+	claim := &resourceapi.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: generatedClaimName, Namespace: "default"},
+		Status: resourceapi.ResourceClaimStatus{
+			Allocation: &resourceapi.AllocationResult{
+				Devices: resourceapi.DeviceAllocationResult{
+					Results: []resourceapi.DeviceRequestAllocationResult{
+						{Driver: "dra.net", Pool: "test-node", Device: "pci-0000-00-1f-0", Request: "req"},
+					},
+				},
+			},
+		},
+	}
+
+	slice := &resourceapi.ResourceSlice{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-node-dra.net"},
+		Spec: resourceapi.ResourceSliceSpec{
+			Driver:   "dra.net",
+			Pool:     resourceapi.ResourcePool{Name: "test-node"},
+			NodeName: "test-node",
+			Devices: []resourceapi.Device{
+				{
+					Name: "pci-0000-00-1f-0",
+					Basic: &resourceapi.BasicDevice{
+						Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+							"dra.net/rdmaDevice": {StringValue: ptrStr("rdmap0s31/1")},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	configs := []DeviceTypeConfig{
+		{
+			Name:            "efa-dra",
+			DriverNames:     []string{"dra.net"},
+			SourceAttribute: "dra.net/rdmaDevice",
+			DeviceIDPattern: regexp.MustCompile(`(rdmap\d+s\d+)`),
+		},
+	}
+
+	s := newTestStoreWithSlices(t, []*corev1.Pod{pod}, []*resourceapi.ResourceClaim{claim}, []*resourceapi.ResourceSlice{slice}, configs)
+
+	// Keyed by the pattern-normalized attribute value.
+	info := s.GetDRAContainerInfo("rdmap0s31", "dra.net")
+	require.NotNil(t, info, "device must be keyed on the normalized attribute value")
+	assert.Equal(t, "efa-pod", info.PodName)
+
+	// NOT keyed by the raw (un-normalized) attribute value.
+	assert.Nil(t, s.GetDRAContainerInfo("rdmap0s31/1", "dra.net"),
+		"device must not be keyed by the raw attribute value when a pattern is set")
+}
+
+func TestStore_AttributeRefMissingAttributeSkips(t *testing.T) {
+	const generatedClaimName = "efa-pod-efa-device-zzz99"
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "efa-pod", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			NodeName: "test-node",
+			ResourceClaims: []corev1.PodResourceClaim{
+				{Name: "efa-device", ResourceClaimTemplateName: ptrStr("efa-template")},
+			},
+			Containers: []corev1.Container{
+				{Name: "app", Resources: corev1.ResourceRequirements{Claims: []corev1.ResourceClaim{{Name: "efa-device"}}}},
+			},
+		},
+		Status: corev1.PodStatus{
+			ResourceClaimStatuses: []corev1.PodResourceClaimStatus{
+				{Name: "efa-device", ResourceClaimName: ptrStr(generatedClaimName)},
+			},
+		},
+	}
+	claim := &resourceapi.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: generatedClaimName, Namespace: "default"},
+		Status: resourceapi.ResourceClaimStatus{
+			Allocation: &resourceapi.AllocationResult{
+				Devices: resourceapi.DeviceAllocationResult{
+					Results: []resourceapi.DeviceRequestAllocationResult{
+						{Driver: "dra.net", Pool: "test-node", Device: "pci-0000-00-1f-0", Request: "req"},
+					},
+				},
+			},
+		},
+	}
+	// Slice device exists but lacks the referenced attribute.
+	slice := &resourceapi.ResourceSlice{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-node-dra.net"},
+		Spec: resourceapi.ResourceSliceSpec{
+			Driver:   "dra.net",
+			Pool:     resourceapi.ResourcePool{Name: "test-node"},
+			NodeName: "test-node",
+			Devices: []resourceapi.Device{
+				{Name: "pci-0000-00-1f-0", Basic: &resourceapi.BasicDevice{
+					Attributes: map[resourceapi.QualifiedName]resourceapi.DeviceAttribute{
+						"dra.net/pciAddress": {StringValue: ptrStr("0000:00:1f.0")},
+					},
+				}},
+			},
+		},
+	}
+	configs := []DeviceTypeConfig{
+		{Name: "efa-dra", DriverNames: []string{"dra.net"}, SourceAttribute: "dra.net/rdmaDevice"},
+	}
+
+	s := newTestStoreWithSlices(t, []*corev1.Pod{pod}, []*resourceapi.ResourceClaim{claim}, []*resourceapi.ResourceSlice{slice}, configs)
+
+	assert.Nil(t, s.GetDRAContainerInfo("rdmap0s31", "dra.net"))
+	assert.Nil(t, s.GetDRAContainerInfo("pci-0000-00-1f-0", "dra.net"))
 }
 
 // --- Multi-container tests ---
@@ -548,7 +869,7 @@ func TestStore_ClaimReferencedByPodButNoContainerClaims(t *testing.T) {
 	info := s.GetDRAContainerInfo("0", "gpu.nvidia.com")
 	require.NotNil(t, info)
 	assert.Equal(t, "no-container-ref", info.PodName)
-	assert.Equal(t, "", info.ContainerName, "empty container name when no container references the claim")
+	assert.Empty(t, info.ContainerName, "empty container name when no container references the claim")
 }
 
 func TestStore_InitContainerClaim(t *testing.T) {
@@ -771,7 +1092,7 @@ func TestStore_DebounceCoalescesRapidEvents(t *testing.T) {
 	podInformer := factory.Core().V1().Pods().Informer()
 	claimInformer := factory.Resource().V1beta1().ResourceClaims().Informer()
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	t.Cleanup(cancel)
 	factory.Start(ctx.Done())
 	cache.WaitForCacheSync(ctx.Done(), podInformer.HasSynced, claimInformer.HasSynced)
@@ -850,12 +1171,12 @@ func TestStore_ConcurrentGetDuringRebuild(t *testing.T) {
 func TestStore_MissingNodeNameError(t *testing.T) {
 	s := NewStore(zap.NewNop())
 	s.nodeName = ""
-	err := s.Start(context.Background())
+	err := s.Start(t.Context())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "node name is required")
 }
 
-func TestStore_StopWithNoStart(t *testing.T) {
+func TestStore_StopWithNoStart(_ *testing.T) {
 	s := NewStore(zap.NewNop(), WithNodeName("node"))
 	// Should not panic.
 	s.Stop()

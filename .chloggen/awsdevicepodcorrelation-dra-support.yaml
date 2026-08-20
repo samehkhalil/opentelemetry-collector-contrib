@@ -1,0 +1,24 @@
+# Use this changelog template to create an entry for release notes.
+# If your change doesn't affect end users, such as a test fix or a tooling change,
+# you should instead start your pull request title with [chore] or use the "Skip Changelog" label.
+
+# One of 'breaking', 'deprecation', 'new_component', 'enhancement', 'bug_fix'
+change_type: enhancement
+
+# The name of the component, or a single word describing the area of concern, (e.g. filelogreceiver)
+component: awsdevicepodcorrelationprocessor
+
+# A brief description of the change.  Surround your text with quotes ("") if it needs to start with a backtick (`).
+note: add DRA device-to-pod correlation with template-claim resolution and ResourceSlice attribute keying
+
+# Mandatory: One or more tracking issues related to the change. You can use the PR number here if no issue exists.
+issues: [631]
+
+# (Optional) One or more lines of additional information to render under the primary note.
+# These lines will be padded with 2 spaces and then inserted directly into the document.
+# Use pipe (|) for multiline entries.
+subtext: |
+  Correlates GPU/Neuron/EFA metrics to pod/namespace/container for devices allocated via
+  Dynamic Resource Allocation by watching Pods and ResourceClaims. Resolves template-generated
+  claim names from pod status, and derives the metric key from either the DRA device name
+  (dra_device_id_pattern) or a ResourceSlice attribute (dra_device_id_attribute).

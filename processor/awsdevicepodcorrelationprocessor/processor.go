@@ -78,8 +78,8 @@ func (p *devicePodCorrelationProcessor) Start(ctx context.Context, _ component.H
 		var configs []dra.DeviceTypeConfig
 		for _, dt := range p.config.DRADeviceTypes {
 			var pattern *regexp.Regexp
-			if dt.DeviceIDPattern != "" {
-				pattern = regexp.MustCompile(dt.DeviceIDPattern)
+			if dt.DRADeviceIDPattern != "" {
+				pattern = regexp.MustCompile(dt.DRADeviceIDPattern)
 			}
 			configs = append(configs, dra.DeviceTypeConfig{
 				Name:              dt.Name,
@@ -87,6 +87,7 @@ func (p *devicePodCorrelationProcessor) Start(ctx context.Context, _ component.H
 				DeviceIDSource:    string(dt.DeviceIDSource),
 				DriverNames:       dt.DriverNames,
 				DeviceIDPattern:   pattern,
+				SourceAttribute:   dt.DRADeviceIDAttribute,
 			})
 		}
 
@@ -98,13 +99,12 @@ func (p *devicePodCorrelationProcessor) Start(ctx context.Context, _ component.H
 		p.draStore = dra.NewStore(p.logger, storeOpts...)
 
 		if err := p.draStore.Start(ctx); err != nil {
-			// DRA failure is non-fatal if device-plugin path is also configured.
-			if p.lookup != nil {
-				p.logger.Warn("DRA store failed to start, DRA correlation unavailable", zap.Error(err))
-				p.draStore = nil
-			} else {
+			// DRA failure is non-fatal if the device-plugin path is also configured.
+			if p.lookup == nil {
 				return err
 			}
+			p.logger.Warn("DRA store failed to start, DRA correlation unavailable", zap.Error(err))
+			p.draStore = nil
 		} else {
 			p.draLookup = p.draStore
 		}
