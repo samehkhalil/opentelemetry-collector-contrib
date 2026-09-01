@@ -180,3 +180,30 @@ env:
 
 - **Device Plugin path**: Works on all supported Kubernetes versions.
 - **DRA path**: Requires Kubernetes 1.32+ (ResourceClaim `resource.k8s.io/v1beta1` API).
+
+## Limitations
+
+### Shared devices (one device, multiple pods)
+
+Both correlation paths assume a device is allocated to a **single** pod, and map
+each device to one pod/namespace/container. This matches the device-plugin model,
+where a device is exclusively allocated to one pod.
+
+DRA additionally allows a device to be **shared** by multiple pods — either by
+several pods referencing the same (non-templated) `ResourceClaim`, or via
+consumable-capacity sharing where one device is split across multiple claims. When
+a device is shared, correlation reports **one** of the consuming pods (the last one
+observed during the map rebuild); the other consumers are not represented.
+
+This is intentional for now, and does not affect the exclusive-allocation case that
+this processor targets (each pod gets its own device — the common GPU/Neuron/EFA
+setup, and the only mode the device-plugin path supports).
+
+A shared device is also inherently ambiguous for device-keyed metrics, independent
+of where the metric comes from. The processor correlates by device identifier and
+attaches pod attributes to the datapoints carrying that identifier; it does not
+interpret the metric's value. When metrics are reported per device, a shared device
+has a single series and no single owning pod, so attributing it to one consumer is
+arbitrary and a device-level value cannot be meaningfully split across consumers.
+Representing shared devices (for example, emitting the datapoint once per consuming
+pod with a "shared" marker) is a distinct feature left to a follow-up.

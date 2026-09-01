@@ -175,6 +175,27 @@ func TestValidate_DuplicateNameAcrossTypes(t *testing.T) {
 	assert.ErrorContains(t, cfg.Validate(), "duplicate name")
 }
 
+func TestValidate_DRADuplicateDriverName(t *testing.T) {
+	t.Parallel()
+	cfg := &Config{
+		DRADeviceTypes: []DRADeviceTypeConfig{
+			{Name: "efa-dra", DeviceIDAttribute: "aws.efa.device", DriverNames: []string{"dra.net"}, DRADeviceIDAttribute: "dra.net/rdmaDevice"},
+			{Name: "efa-dra-2", DeviceIDAttribute: "aws.efa.device", DriverNames: []string{"dra.net"}, DRADeviceIDPattern: `(rdmap\d+s\d+)`},
+		},
+	}
+	assert.ErrorContains(t, cfg.Validate(), "duplicate driver name")
+}
+
+func TestValidate_DRAEmptyDriverName(t *testing.T) {
+	t.Parallel()
+	cfg := &Config{
+		DRADeviceTypes: []DRADeviceTypeConfig{
+			{Name: "gpu-dra", DeviceIDAttribute: "dev", DriverNames: []string{""}},
+		},
+	}
+	assert.ErrorContains(t, cfg.Validate(), "driver_names must not contain an empty string")
+}
+
 func TestSetDefaults_DRADeviceIDSource(t *testing.T) {
 	cfg := &Config{
 		DRADeviceTypes: []DRADeviceTypeConfig{

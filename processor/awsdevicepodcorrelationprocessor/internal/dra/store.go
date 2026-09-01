@@ -28,6 +28,14 @@ const (
 	// debounceInterval is the minimum time between consecutive rebuilds.
 	// Events arriving within this window are coalesced into a single rebuild.
 	debounceInterval = 500 * time.Millisecond
+
+	// cacheSyncTimeout bounds the initial informer cache sync so a missing RBAC
+	// rule (resourceclaims/resourceslices) cannot block collector startup
+	// indefinitely. A healthy sync completes in well under this budget; it is
+	// only reached in the failure/slow path, where it caps how long startup
+	// blocks before the caller falls back to the device-plugin path (or fails
+	// when DRA is the only configured path).
+	cacheSyncTimeout = 15 * time.Second
 )
 
 // DeviceTypeConfig holds pre-compiled configuration for a DRA device type.
@@ -154,7 +162,12 @@ func (s *Store) Start(ctx context.Context) error {
 		s.client = client
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
+	// The informers must outlive Start. The collector may cancel the startup
+	// context once Start returns, so give the reflectors a lifetime owned by the
+	// Store (rooted at context.Background()) and cancelled in Stop(). Deriving it
+	// from the caller's ctx would let a post-startup cancellation silently stop
+	// all reflectors while the Store keeps serving a stale map.
+	runCtx, cancel := context.WithCancel(context.Background())
 	s.cancel = cancel
 
 	// Watch pods on this node only.
@@ -205,19 +218,29 @@ func (s *Store) Start(ctx context.Context) error {
 		}
 	}
 
-	s.podFactory.Start(ctx.Done())
-	s.claimFactory.Start(ctx.Done())
+	s.podFactory.Start(runCtx.Done())
+	s.claimFactory.Start(runCtx.Done())
 
 	syncFuncs := []cache.InformerSynced{podInformer.HasSynced, claimInformer.HasSynced}
 	if s.sliceInformer != nil {
-		s.sliceFactory.Start(ctx.Done())
+		s.sliceFactory.Start(runCtx.Done())
 		syncFuncs = append(syncFuncs, s.sliceInformer.HasSynced)
 	}
 
-	// Wait for initial cache sync.
-	if !cache.WaitForCacheSync(ctx.Done(), syncFuncs...) {
+	// Wait for the initial cache sync, but bound it. Without a deadline, missing
+	// get/list/watch RBAC on resourceclaims (or resourceslices) makes the
+	// reflectors retry indefinitely and WaitForCacheSync never returns, hanging
+	// collector startup. The startup ctx still aborts the wait early if the
+	// collector is shutting down. On failure we tear down our own reflectors and
+	// return an error; the caller decides whether that is fatal (DRA-only) or a
+	// non-fatal fallback to the device-plugin path.
+	syncCtx, syncCancel := context.WithTimeout(ctx, cacheSyncTimeout)
+	defer syncCancel()
+	if !cache.WaitForCacheSync(syncCtx.Done(), syncFuncs...) {
 		cancel()
-		return errors.New("failed to sync informer caches")
+		return fmt.Errorf("DRA informer caches did not sync within %s "+
+			"(verify the ServiceAccount has get/list/watch on resourceclaims"+
+			" and, when dra_device_id_attribute is set, resourceslices)", cacheSyncTimeout)
 	}
 
 	s.rebuild()

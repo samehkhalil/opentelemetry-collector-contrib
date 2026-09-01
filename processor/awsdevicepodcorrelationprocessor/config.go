@@ -141,6 +141,11 @@ func (cfg *Config) Validate() error {
 		seen[dt.Name] = true
 	}
 
+	// A DRA driver may appear in only one dra_device_types entry: the store keys
+	// its device->pod map by driver name, so a driver listed twice (with
+	// different dra_device_id_attribute / dra_device_id_pattern) would have one
+	// entry's keying silently overwrite the other's. Reject that at config time.
+	seenDrivers := make(map[string]bool)
 	for i := range cfg.DRADeviceTypes {
 		dt := &cfg.DRADeviceTypes[i]
 		if dt.Name == "" {
@@ -151,6 +156,16 @@ func (cfg *Config) Validate() error {
 		}
 		if len(dt.DriverNames) == 0 {
 			return fmt.Errorf("dra_device_types[%d]: driver_names must not be empty", i)
+		}
+		for _, dn := range dt.DriverNames {
+			if dn == "" {
+				return fmt.Errorf("dra_device_types[%d]: driver_names must not contain an empty string", i)
+			}
+			if seenDrivers[dn] {
+				return fmt.Errorf("dra_device_types[%d]: duplicate driver name %q across dra_device_types entries; "+
+					"each DRA driver may appear in only one entry because correlation is keyed by driver", i, dn)
+			}
+			seenDrivers[dn] = true
 		}
 		if dt.DeviceIDSource != "" && dt.DeviceIDSource != DeviceIDSourceDatapoint && dt.DeviceIDSource != DeviceIDSourceResource {
 			return fmt.Errorf("dra_device_types[%d]: device_id_source must be %q or %q, got %q", i, DeviceIDSourceDatapoint, DeviceIDSourceResource, dt.DeviceIDSource)
