@@ -1242,3 +1242,101 @@ func TestStore_MultipleDriverNames(t *testing.T) {
 	info = s.GetDRAContainerInfo("0", "gpu.amd.com")
 	assert.Nil(t, info)
 }
+
+// TestStore_SharedDeviceAcrossPods_DroppedNotMisattributed verifies that when a
+// single directly-referenced ResourceClaim (and thus one allocated device) is
+// shared by two distinct pods, the device is dropped from the correlation map
+// rather than attributed to one arbitrary pod. The datapoint then flows through
+// unattributed instead of confidently-wrong.
+func TestStore_SharedDeviceAcrossPods_DroppedNotMisattributed(t *testing.T) {
+	// Two pods on the same node both reference the same (non-templated) claim.
+	podA := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared-pod-a", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			NodeName: "test-node",
+			ResourceClaims: []corev1.PodResourceClaim{
+				{Name: "gpu", ResourceClaimName: ptrStr("shared-claim")},
+			},
+			Containers: []corev1.Container{
+				{Name: "c", Resources: corev1.ResourceRequirements{Claims: []corev1.ResourceClaim{{Name: "gpu"}}}},
+			},
+		},
+	}
+	podB := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared-pod-b", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			NodeName: "test-node",
+			ResourceClaims: []corev1.PodResourceClaim{
+				{Name: "gpu", ResourceClaimName: ptrStr("shared-claim")},
+			},
+			Containers: []corev1.Container{
+				{Name: "c", Resources: corev1.ResourceRequirements{Claims: []corev1.ResourceClaim{{Name: "gpu"}}}},
+			},
+		},
+	}
+
+	claim := &resourceapi.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared-claim", Namespace: "default"},
+		Status: resourceapi.ResourceClaimStatus{
+			Allocation: &resourceapi.AllocationResult{
+				Devices: resourceapi.DeviceAllocationResult{
+					Results: []resourceapi.DeviceRequestAllocationResult{
+						{Driver: "gpu.nvidia.com", Pool: "pool", Device: "gpu-0", Request: "req"},
+					},
+				},
+			},
+		},
+	}
+
+	configs := []DeviceTypeConfig{
+		{Name: "gpu", DriverNames: []string{"gpu.nvidia.com"}, DeviceIDPattern: regexp.MustCompile(`gpu-(\d+)`)},
+	}
+
+	s := newTestStore(t, []*corev1.Pod{podA, podB}, []*resourceapi.ResourceClaim{claim}, configs)
+
+	info := s.GetDRAContainerInfo("0", "gpu.nvidia.com")
+	assert.Nil(t, info, "shared device must not be correlated to any single pod")
+}
+
+// TestStore_SameDeviceSamePodNotDropped verifies that a same-pod collision (two
+// containers of one pod referencing the same claim/device) is NOT treated as a
+// shared device: pod-level attribution is still correct, so the device is kept.
+func TestStore_SameDeviceSamePodNotDropped(t *testing.T) {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "solo-pod", Namespace: "default"},
+		Spec: corev1.PodSpec{
+			NodeName: "test-node",
+			ResourceClaims: []corev1.PodResourceClaim{
+				{Name: "gpu", ResourceClaimName: ptrStr("solo-claim")},
+			},
+			Containers: []corev1.Container{
+				{Name: "first", Resources: corev1.ResourceRequirements{Claims: []corev1.ResourceClaim{{Name: "gpu"}}}},
+				{Name: "second", Resources: corev1.ResourceRequirements{Claims: []corev1.ResourceClaim{{Name: "gpu"}}}},
+			},
+		},
+	}
+
+	claim := &resourceapi.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "solo-claim", Namespace: "default"},
+		Status: resourceapi.ResourceClaimStatus{
+			Allocation: &resourceapi.AllocationResult{
+				Devices: resourceapi.DeviceAllocationResult{
+					Results: []resourceapi.DeviceRequestAllocationResult{
+						{Driver: "gpu.nvidia.com", Pool: "pool", Device: "gpu-0", Request: "req"},
+					},
+				},
+			},
+		},
+	}
+
+	configs := []DeviceTypeConfig{
+		{Name: "gpu", DriverNames: []string{"gpu.nvidia.com"}, DeviceIDPattern: regexp.MustCompile(`gpu-(\d+)`)},
+	}
+
+	s := newTestStore(t, []*corev1.Pod{pod}, []*resourceapi.ResourceClaim{claim}, configs)
+
+	info := s.GetDRAContainerInfo("0", "gpu.nvidia.com")
+	require.NotNil(t, info, "same-pod collision must not drop the device")
+	assert.Equal(t, "solo-pod", info.PodName)
+	assert.Equal(t, "first", info.ContainerName, "first container wins for same-pod shared claim")
+}

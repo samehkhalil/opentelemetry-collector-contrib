@@ -192,18 +192,24 @@ where a device is exclusively allocated to one pod.
 DRA additionally allows a device to be **shared** by multiple pods — either by
 several pods referencing the same (non-templated) `ResourceClaim`, or via
 consumable-capacity sharing where one device is split across multiple claims. When
-a device is shared, correlation reports **one** of the consuming pods (the last one
-observed during the map rebuild); the other consumers are not represented.
+the DRA store detects that a device is claimed by more than one distinct pod, it
+**drops that device from the correlation map** rather than attributing it to one
+arbitrary consumer. The device's datapoints then flow through **unattributed** (no
+pod/namespace/container attributes) instead of carrying a confidently-wrong owner.
+Detection is order-independent and node-local: physical devices are node-scoped, so
+every consumer of a given device is visible on the same node during the rebuild.
 
-This is intentional for now, and does not affect the exclusive-allocation case that
-this processor targets (each pod gets its own device — the common GPU/Neuron/EFA
-setup, and the only mode the device-plugin path supports).
+This does not affect the exclusive-allocation case that this processor targets (each
+pod gets its own device — the common GPU/Neuron/EFA setup, and the only mode the
+device-plugin path supports). It is also why templated claims are never dropped: a
+`ResourceClaimTemplate` gives each pod its own claim, so no key collides.
 
-A shared device is also inherently ambiguous for device-keyed metrics, independent
+A shared device remains inherently ambiguous for device-keyed metrics, independent
 of where the metric comes from. The processor correlates by device identifier and
 attaches pod attributes to the datapoints carrying that identifier; it does not
 interpret the metric's value. When metrics are reported per device, a shared device
-has a single series and no single owning pod, so attributing it to one consumer is
-arbitrary and a device-level value cannot be meaningfully split across consumers.
-Representing shared devices (for example, emitting the datapoint once per consuming
-pod with a "shared" marker) is a distinct feature left to a follow-up.
+has a single series and no single owning pod, so a device-level value cannot be
+meaningfully split across consumers — emitting it unattributed is the honest
+representation. Fully representing shared devices (for example, emitting the
+datapoint once per consuming pod with a "shared" marker) is a distinct feature left
+to a follow-up.

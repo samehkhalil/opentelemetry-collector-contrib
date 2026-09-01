@@ -331,6 +331,15 @@ func (s *Store) rebuild() {
 	}
 
 	newMap := make(map[draDeviceKey]types.ContainerInfo)
+	// shared tracks device keys claimed by more than one distinct pod. A device
+	// can only be correlated to a single owning pod; when several pods share one
+	// (a directly-referenced ResourceClaim reused by multiple pods, or consumable-
+	// capacity sharing), there is no single correct owner. Rather than pick one
+	// arbitrarily and emit a confidently-wrong attribution, we drop such keys so
+	// the datapoint flows through unattributed. Detection is order-independent:
+	// once two distinct pods hit the same key it is marked and removed below,
+	// regardless of pod/claim list order.
+	shared := make(map[draDeviceKey]struct{})
 
 	for _, obj := range pods {
 		pod, ok := obj.(*corev1.Pod)
@@ -398,13 +407,31 @@ func (s *Store) rebuild() {
 					}
 				}
 
-				newMap[draDeviceKey{DeviceID: lookupID, DriverName: result.Driver}] = types.ContainerInfo{
+				key := draDeviceKey{DeviceID: lookupID, DriverName: result.Driver}
+				info := types.ContainerInfo{
 					PodName:       pod.Name,
 					ContainerName: containerName,
 					Namespace:     pod.Namespace,
 				}
+				// A collision from a different pod means the device is shared.
+				// Same-pod collisions (e.g. two containers of one pod) keep the
+				// pod-level attribution and are not treated as ambiguous.
+				if prev, ok := newMap[key]; ok && (prev.PodName != info.PodName || prev.Namespace != info.Namespace) {
+					shared[key] = struct{}{}
+				}
+				newMap[key] = info
 			}
 		}
+	}
+
+	// Drop shared devices: no single owning pod, so emit unattributed rather than
+	// misattributed. See the "Shared devices" limitation in the README.
+	for key := range shared {
+		delete(newMap, key)
+		s.logger.Warn("DRA device claimed by multiple pods; dropping correlation to avoid misattribution",
+			zap.String("driver", key.DriverName),
+			zap.String("device", key.DeviceID),
+		)
 	}
 
 	s.mu.Lock()
